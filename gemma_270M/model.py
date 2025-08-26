@@ -4,12 +4,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from typing import Optional
 from dataclasses import dataclass
+from typing import Optional, Tuple
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 @dataclass
-class TransformerConfig:
+class GEMMA3_270M_CONFIG:
     vocab_size: int = 262_144
     context_length: int = 32_768
     emb_dim: int = 640
@@ -17,30 +18,136 @@ class TransformerConfig:
     n_layers: int = 18
     hidden_dim: int = 2048
     head_dim: int = 256
-    sliding_window: int = 512
     n_kv_groups: int = 1
+    sliding_window: int = 512
     rope_local_base: float = 10_000.0
     rope_base: float = 1_000_000.0
     qk_norm: bool = True
+    layer_type: Tuple[str, ...] = ("sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention")
+    dtype: torch.dtype = torch.bfloat16
 
-def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-    # B, T, C = x.shape
-    x0 = x[..., 0::2] 
-    x1 = x[..., 1::2]
-    x_rotated_even = x0 * cos - x1 * sin
-    x_rotated_odd = x0 * sin + x1 * cos
-    x = torch.stack((x_rotated_even, x_rotated_odd), dim=-1) #B, T, C//2, 2
-    x = x.flatten(-2) #B, T, C
-    return x
-
-
-class FeedForward(nn.Module):
-    def __init__(self, config: TransformerConfig):
+class TransformerEmbedder(nn.Module):
+    def __init__(self, config):
         super().__init__()
         self.config = config
-        self.w1 = nn.Linear(config.emb_dim, config.hidden_dim)
-        self.w2 = nn.Linear(config.emb_dim, config.hidden_dim)
-        self.w3 = nn.Linear(config.hidden_dim, config.emb_dim)
+        self.embed_table = nn.Embedding(config.vocab_size, config.emb_dim)
+
+    def forward(self, idx):
+        x = self.embed_table(idx)
+        x = x * math.sqrt(self.config.emb_dim)
+        return x
+
+class GroupedQueryAttention(nn.Module):
+    def __init__(self, config, layer_type):
+        super().__init__()
+        self.config = config
+        self.layer_type = layer_type
+        self.proj_q = nn.Linear(config.emb_dim, config.n_heads * config.head_dim, bias=False)
+        self.proj_k = nn.Linear(config.emb_dim, config.n_kv_groups * config.head_dim, bias=False)
+        self.proj_v = nn.Linear(config.emb_dim, config.n_kv_groups * config.head_dim, bias=False)
+        self.proj_o = nn.Linear(config.n_heads * config.head_dim, config.emb_dim, bias=False)
+        if config.qk_norm == True:
+            self.q_norm = nn.RMSNorm(config.head_dim, eps=1e-6)
+            self.k_norm = nn.RMSNorm(config.head_dim, eps=1e-6)
+        else:
+            self.q_norm = None
+            self.k_norm = None
+    
+    @staticmethod
+    def get_rope_params(head_dim, theta, length, dtype=torch.float32):
+        wavelength = theta ** (torch.arange(0, head_dim, 2, dtype=dtype, device=device) / head_dim).unsqueeze(0) #1, head/dim//2
+        freq = 1 / wavelength
+        positions = torch.arange(length, dtype=dtype, device=device).unsqueeze(1) #length, 1
+        angles = positions @ freq #length, head_dim//2
+        cos = torch.cos(angles)
+        sin = torch.sin(angles)
+        return cos, sin
+    
+    @staticmethod
+    def apply_rope(x, cos, sin):
+        #B, T, C = x.shape
+        x_even = x[..., 0::2] #B, T, C//2
+        x_odd = x[..., 1::2] #B, T, C//2
+        a = x_even*cos - x_odd*sin #B, T, C//2
+        b = x_even*sin + x_odd*cos #B, T, C//2
+        x = torch.stack([a, b], dim = -1) #B, T, C//2, 2
+        x = x.flatten(-2) #B, T, C
+        return x
+
+    def forward(self, x):
+        B, T, C = x.shape #B, T, emb_dim
+        q = self.proj_q(x) #B, T, n_heads * head_dim
+        k = self.proj_k(x) #B, T, n_kv_groups * head_dim
+        v = self.proj_v(x) #B, T, n_kv_groups * head_dim
+
+        q = q.reshape(B, T, self.config.n_heads, self.config.head_dim) #B, T, n_heads, head_dim
+        k = k.reshape(B, T, self.config.n_kv_groups, self.config.head_dim) #B, T, n_kv_groups, head_dim
+        v = v.reshape(B, T, self.config.n_kv_groups, self.config.head_dim) #B, T, n_kv_groups, head_dim
+
+        q = q.transpose(1, 2) #B, n_heads, T, head_dim
+        k = k.transpose(1, 2) #B, n_kv_groups, T, head_dim
+        v = v.transpose(1, 2) #B, n_kv_groups, T, head_dim
+
+        repeat_factor = self.config.n_heads // self.config.n_kv_groups
+        q = q.reshape(B, self.config.n_kv_groups, repeat_factor, T, self.config.head_dim) #B, n_kv_groups, repeat_factor, T, head_dim
+        k = k.unsqueeze(2) #B, n_kv_groups, 1, T, head_dim
+        v = v.unsqueeze(2) #B, n_kv_groups, 1, T, head_dim
+
+        if self.q_norm is not None:
+            q, k = self.q_norm(q), self.k_norm(k)
+
+        if self.layer_type == "sliding_attention":
+            theta = self.config.rope_local_base
+            offset = -self.config.sliding_window
+            mask = torch.triu(torch.tril(torch.ones((T, T), device=x.device)), diagonal = offset) #Not registering a gull context length buffer for memory constraints' reasons
+        elif self.layer_type == "full_attention":
+            theta = self.config.rope_base
+            mask = torch.tril(torch.ones((T, T), device=x.device)) #Not registering a gull context length buffer for memory constraints' reasons
+        
+        cos, sin = self.get_rope_params(self.config.head_dim, theta, T, dtype=q.dtype)
+        cos, sin = cos.to(x.device), sin.to(x.device)
+        
+        q = self.apply_rope(q, cos, sin)
+        k = self.apply_rope(k, cos, sin)
+
+        attn_scores = q.float() @ k.transpose(-1, -2).float() #B, n_kv_groups, repeat_factor, T, T
+        attn_scores = attn_scores / math.sqrt(self.config.head_dim)
+        
+        attn_scores = attn_scores.masked_fill(mask == 0, float("-inf"))
+        attn_scores = F.softmax(attn_scores, dim=-1)
+        attn_scores = attn_scores.to(dtype=self.config.dtype) #going back to bf16 after accumulation in full precision
+
+        ctx = attn_scores @ v #B, n_kv_groups, repeat_factor, T, head_dim
+        ctx = ctx.reshape(B, self.config.n_heads, T, self.config.head_dim)
+        ctx = ctx.transpose(1, 2) #B, T, n_heads, head_dim
+        ctx = ctx.reshape(B, T, self.config.n_heads * self.config.head_dim) #B, T, n_heads*head_dim
+        x = self.proj_o(ctx)
+        return x
+    
+class FeedForward(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.w1 = nn.Linear(config.emb_dim, config.hidden_dim, bias=False)
+        self.w2 = nn.Linear(config.emb_dim, config.hidden_dim, bias=False)
+        self.w3 = nn.Linear(config.hidden_dim, config.emb_dim, bias=False)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -51,129 +158,64 @@ class FeedForward(nn.Module):
         x = self.w3(x)   # B, T, emb_dim
         return x
 
-
-class TransformerEmbedder(nn.Module):
-    def __init__(self, config: TransformerConfig):
-        super().__init__()
-        self.config = config
-        self.tok_emb_table = nn.Embedding(config.vocab_size, config.emb_dim)
-        self.proj_in = nn.Linear(config.emb_dim, config.emb_dim)
-    def forward(self, idx):
-        B, T = idx.shape
-        assert T <= self.config.context_length
-        x = self.tok_emb_table(idx)  # B, T, emb_dim
-        x = self.proj_in(x)
-        return x
-
-
-class GroupedQueryAttention(nn.Module):
-    def __init__(self, config: TransformerConfig):
-        super().__init__()
-        self.config = config
-
-        assert config.emb_dim % config.n_heads == 0
-        assert config.n_heads % config.n_kv_groups == 0
-        assert config.head_dim % 2 == 0
-
-        self.proj_q = nn.Linear(config.emb_dim, config.emb_dim, bias=False)
-        self.proj_k = nn.Linear(config.emb_dim, config.n_kv_groups * config.head_dim, bias=False)
-        self.proj_v = nn.Linear(config.emb_dim, config.n_kv_groups * config.head_dim, bias=False)
-        self.proj_o = nn.Linear(config.emb_dim, config.emb_dim, bias=False)
-        self.register_buffer("mask", torch.triu(torch.tril(torch.ones(config.context_length, config.context_length)),diagonal=-config.sliding_window,),persistent=False)
-
-        inv_freq = 1.0 / (config.rope_base ** (torch.arange(0, config.head_dim, 2).float() / config.head_dim))  # (D/2,)
-        t = torch.arange(config.context_length, dtype=torch.float)  # (T,)
-        freqs = torch.outer(t, inv_freq)  # (T, D/2)
-        cos = torch.cos(freqs).repeat_interleave(2, dim=-1)  # (T, D)
-        sin = torch.sin(freqs).repeat_interleave(2, dim=-1)  # (T, D)
-        
-        self.register_buffer("rope_cos", cos[None, None, :, :], persistent=False)
-        self.register_buffer("rope_sin", sin[None, None, :, :], persistent=False)
-
-        if config.qk_norm:
-            self.q_norm = nn.RMSNorm(config.head_dim, eps=1e-6)
-            self.k_norm = nn.RMSNorm(config.head_dim, eps=1e-6)
-        else:
-            self.q_norm = None
-            self.k_norm = None
-
-    def forward(self, x):
-        B, T, C = x.shape #B, T, emb_dim
-        
-        repeat_factor = self.config.n_heads // self.config.n_kv_groups
-
-        q = self.proj_q(x).reshape(B, T, self.config.n_heads, self.config.head_dim)   # B, T, n_heads, head_dim
-        k = self.proj_k(x).reshape(B, T, self.config.n_kv_groups, self.config.head_dim)   # B, T, n_kv_groups, head_dim
-        v = self.proj_v(x).reshape(B, T, self.config.n_kv_groups, self.config.head_dim)   # B, T, n_kv_groups, head_dim
-
-        if self.q_norm is not None:
-            q = self.q_norm(q)
-        if self.k_norm is not None:
-            k = self.k_norm(k)
-
-        
-        cos = self.rope_cos[:, :, :T, :].to(dtype=q.dtype, device=q.device)  # 1, 1, T, head_dim
-        sin = self.rope_sin[:, :, :T, :].to(dtype=q.dtype, device=q.device)  # 1, 1, T, head_dim
-        q = apply_rope(q, cos, sin)  # B, T, n_heads, head_dim
-        k = apply_rope(k, cos, sin)  # B, T, n_kv_groups, head_dim
-
-        q = q.transpose(1, 2)  # B, n_heads, T, head_dim
-        k = k.transpose(1, 2)  # B, n_kv_groups, T, head_dim
-        v = v.transpose(1, 2)  # B, n_kv_groups, T, head_dim
-
-
-        k = k.repeat_interleave(repeat_factor, dim=1)  # B, H, T, head_dim
-        v = v.repeat_interleave(repeat_factor, dim=1)  # B, H, T, head_dim
-
-        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.config.head_dim)  # B, H, T, T
-        scores = scores.masked_fill(self.mask[:T, :T] == 0, float("-inf"))
-        attn = F.softmax(scores, dim=-1)
-
-        out = attn @ v                             # B, n_heads, T, head_dim
-        out = out.transpose(1, 2).reshape(B, T, C) # B, T, emb_dim
-        out = self.proj_o(out)                     # B, T, emb_dim
-        return out
-
-
-
 class TransformerBlock(nn.Module):
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, config, layer_type):
         super().__init__()
         self.config = config
-        self.n1 = nn.RMSNorm(config.emb_dim)
-        self.n2 = nn.RMSNorm(config.emb_dim)
-        self.n3 = nn.RMSNorm(config.emb_dim)
-        self.n4 = nn.RMSNorm(config.emb_dim)
-        self.attn = GroupedQueryAttention(config)
+        self.layer_type = layer_type
+        self.attn = GroupedQueryAttention(config, layer_type)
         self.ffn = FeedForward(config)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.n2(x + self.attn(self.n1(x)))
-        x = self.n4(x + self.ffn(self.n3(x)))
+        self.n1 = nn.RMSNorm(config.emb_dim, eps=1e-6)
+        self.n2 = nn.RMSNorm(config.emb_dim, eps=1e-6)
+        self.n3 = nn.RMSNorm(config.emb_dim, eps=1e-6)
+        self.n4 = nn.RMSNorm(config.emb_dim, eps=1e-6)
+    def forward(self, x):
+        x = x + self.n2(self.attn(self.n1(x)))
+        x = x + self.n4(self.ffn(self.n3(x)))
         return x
-
 
 class TransformerModel(nn.Module):
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, config, layer_types):
         super().__init__()
         self.config = config
-        self.embed = TransformerEmbedder(config)
-        self.blocks = nn.ModuleList([TransformerBlock(config) for _ in range(config.n_layers)])
-        self.n_f = nn.RMSNorm(config.emb_dim)
-        self.lm_head = nn.Linear(config.emb_dim, config.vocab_size, bias=False)
+        self.layer_types = layer_types
+        self.embedder = TransformerEmbedder(config)
+        self.blocks = nn.ModuleList([TransformerBlock(config, layer_type) for layer_type in layer_types])
+        self.n5 = nn.RMSNorm(config.emb_dim, eps=1e-6)
+        self.proj_o = nn.Linear(config.emb_dim, config.vocab_size, bias=False) #can also be tied to the embeddinga
+    def forward(self, idx, targets=None):
+        idx = idx.to(device)
+        x = self.embedder(idx)
+        for block in self.blocks:
+            x = block(x)
+        x = self.n5(x)
+        logits = self.proj_o(x)
+        if targets is not None:
+            targets = targets.to(device)
+            assert idx.shape == targets.shape
+            B, T, C = logits.shape
+            loss = F.cross_entropy(logits.float().view(B*T, C), targets.view(-1))
+        else:
+            loss = None
+        return logits, loss
+    def generate(self, idx, max_new_tokens):
+        self.eval()
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -self.config.context_length:]
+            with torch.no_grad():
+                logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] #B, C
+            probs = F.softmax(logits, dim=-1) #B, C
+            idx_next = torch.multinomial(probs, num_samples=1) #B, 1
+            idx = torch.cat((idx, idx_next), dim=1) #B, T+1
+        self.train() 
+        return idx
 
-    def forward(self, idx: torch.Tensor):
-        x = self.embed(idx)                  # B, T, C
-        for blk in self.blocks:
-            x = blk(x)
-        x = self.n_f(x)
-        logits = self.lm_head(x)             # B, T, V
-        return logits
-    
-#config = TransformerConfig()
-#m = TransformerModel(config)
+config = GEMMA3_270M_CONFIG()
+layer_types = config.layer_type
+m = TransformerModel(config, layer_types).to(device=device, dtype=config.dtype)
 
-#num_parameters = sum([p.numel() for p in m.parameters()])
-#print(num_parameters)
+num_parameters = sum([p.numel() for p in m.parameters()])
+print(f"total number of parameters: {num_parameters}, If we tie input and output projections: {num_parameters - m.embedder.embed_table.weight.numel()}")
 
 
