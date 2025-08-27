@@ -69,28 +69,7 @@ for _ in range(num_steps):
         m.train()
     optimizer.step()
 
-#Plot
-T = len(train_losses)
-V = len(val_losses)
-k = max(1, round(T / V)) if V else 10
-labels = [str(i) for i in range(T)]
-val_expanded = [None] * T
-for j, v in enumerate(val_losses):
-    i = min(T - 1, j * k)
-    val_expanded[i] = v
-chart = Line("Training and Validation Loss", width="1200px", height="640px")
-chart.set_options(
-    labels=labels,
-    x_label="Steps",
-    y_label="Loss",
-    y_tick_count=6,
-    legend_pos="upLeft",   
-)
-chart.add_series("Train Loss", train_losses)
-if any(x is not None for x in val_expanded):
-    chart.add_series("Val Loss", val_expanded)
-out_file = "loss_cutecharts.html"
-chart.render(out_file)
+
 
 
 
