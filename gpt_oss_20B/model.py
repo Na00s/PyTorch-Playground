@@ -128,7 +128,7 @@ class GroupedQueryAttention(nn.Module):
         k = k.transpose(1, 2) #B, n_kv_heads, T, head_dim
         v = v.transpose(1, 2) #B, n_kv_heads, T, head_dim
 
-        cos, sin = self.get_rope_params(theta=self.config.rope_theta, head_dim=self.config.head_dim, length=q.size(3), device=x.device)
+        cos, sin = self.get_rope_params(theta=self.config.rope_theta, head_dim=self.config.head_dim, length=q.size(2), device=x.device)
         q = self.apply_rope(q, cos, sin).to(dtype=x.dtype)
         k = self.apply_rope(k, cos, sin).to(dtype=x.dtype)
 
@@ -257,7 +257,7 @@ class TransformerModel(nn.Module):
 
 
 config = GPT_OSS_20B() 
-m = TransformerModel(config, config.layer_types)       
+m = TransformerModel(config)       
 
 num_params = sum([p.numel() for p in m.parameters()])
 print(num_params)
