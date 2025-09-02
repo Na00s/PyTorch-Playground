@@ -257,7 +257,7 @@ class TransformerModel(nn.Module):
 
 
 config = GPT_OSS_20B() 
-m = TransformerModel(config)       
+m = TransformerModel(config, config.layer_types)       
 
 num_params = sum([p.numel() for p in m.parameters()])
 print(num_params)
