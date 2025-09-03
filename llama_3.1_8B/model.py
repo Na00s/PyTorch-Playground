@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from dataclasses import dataclass
-from typing import Optional, Literal
+from typing import Optional, Literal, List, Tuple
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -39,139 +39,95 @@ class TransformerEmbedder(nn.Module):
         super().__init__()
         self.config = config
         self.tok_emb_table = nn.Embedding(config.vocab_size, config.hidden_size)
-
     def forward(self, idx):
-        B, T = idx.shape
-        assert T <= self.config.max_position_embeddings
-        x = self.tok_emb_table(idx) #B, T, hidden_size
+        B, T = x.shape
+        assert (T <= self.config.original_max_position_embeddings)
+        x = self.tok_emb_table(idx) #B, T, C
         return x
-    
-    
+
 class GroupedQueryAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.proj_q = nn.Linear(config.hidden_size, config.num_attention_heads * config.head_size, bias=False)
-        self.proj_k = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_size, bias=False)
-        self.proj_v = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_size, bias=False)
-        self.proj_o = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-
+        self.proj_q = nn.Linear(config.hidden_size, config.num_attention_heads*config.head_size)
+        self.proj_k = nn.Linear(config.hidden_size, config.num_key_value_heads*config.head_size)
+        self.proj_v = nn.Linear(config.hidden_size, config.num_key_value_heads*config.head_size)
+        self.proj_o = nn.Linear(config.num_attention_heads*config.head_size, config.hidden_size)
     @staticmethod
-    def get_rope_params(theta, head_size, length, device):
-        wavelength = theta ** (torch.arange(0, head_size, 2, device=device) / head_size).unsqueeze(0).float() #1, head_dim//2
-        freq = 1 / wavelength
-        positions = torch.arange(length, device=device).unsqueeze(1).float() #length, 1
-        angles = positions @ freq #length, head_dim//2
-        cos = torch.cos(angles) #length, head_dim//2
-        sin = torch.sin(angles) #length, head_dim//2
+    def get_rope_params(theta, length, head_dim, past_len=0):
+        freq = theta ** ((-torch.arange(0, head_dim, 2))/head_dim).unsqueeze(0) # 1, head_dim//2
+        pos = torch.arange(past_len, past_len + length).unsqueeze(1) #T, 1
+        angles = pos * freq #T, head_dim//2
+        cos = torch.cos(angles) #T, head_dim//2
+        sin = torch.sin(angles) #T, head_dim//2
         return cos, sin
-    
     @staticmethod
     def apply_rope(x, cos, sin):
-        x_even = x[..., 0::2] #B, T, head_dim//2
-        x_odd = x[..., 1::2] #B, T, head_dim//2
-        a = x_even * cos - x_odd * sin #B, T, head_dim//2
-        b = x_even * sin + x_odd * cos #B, T, head_dim//2
-        x = torch.stack([a, b], dim=-1) #B, T, head_dim//2, 2
-        x = x.flatten(-2) #B, T, head_dim
+        cos = cos.to(device=x.device)
+        sin = sin.to(device=x.device)
+        x_even = x[..., 0::2] #..., C//2
+        x_odd = x[..., 1::2] #..., C//2
+        u = x_even*cos - x_odd*sin
+        v = x_even*sin + x_odd*cos
+        x = torch.stack([u, v], dim=-1) #..., C//2, 2
+        x = x.flatten(-2) #..., C
         return x
-    
-    def forward(self, x):
-        B, T, C = x.shape #B, T, hidden_size
-        q = self.proj_q(x) #B, T, hidden_size
-        k = self.proj_k(x) #B, T, n_kv_heads * head_size
-        v = self.proj_v(x) #B, T, n_kv_heads * head_size
+    def forward(self, x, past_k, past_v, use_cache=False):
+        B, T, C = x.shape
+        q = self.proj_q(x) #B, T, num_attention_heads*head_size
+        k = self.proj_k(x) #B, T, num_key_value_heads*head_size
+        v = self.proj_v(x) #B, T, num_key_value_heads*head_size
 
-        q = q.reshape(B, T, self.config.num_attention_heads, self.config.head_size)
-        k = k.reshape(B, T, self.config.num_key_value_heads, self.config.head_size)
-        v = v.reshape(B, T, self.config.num_key_value_heads, self.config.head_size)
+        q = q.reshape(B, T, self.config.num_attention_heads, self.config.head_size) #B, T, num_attention_heads, head_size
+        k = k.reshape(B, T, self.config.num_key_value_heads, self.config.head_size) #B, T, num_key_value_heads, head_size
+        v = v.reshape(B, T, self.config.num_key_value_heads, self.config.head_size) #B, T, num_key_value_heads, head_size
 
-        q = q.transpose(1, 2) #B, n_heads, T, head_size
-        k = k.transpose(1, 2) #B, n_kv_heads, T, head_size
-        v = v.transpose(1, 2) #B, n_kv_heads, T, head_size
+        q = q.transpose(1, 2) #B, num_attention_heads, T, head_size
+        k = k.transpose(1, 2) #B, num_key_value_heads, T, head_size
+        v = v.transpose(1, 2) #B, num_key_value_heads, T, head_size
+
+        past_length = 0 if past_k is None else past_k.size(2)
+        cos, sin = self.get_rope_params(self.config.rope_theta, T, self.config.head_size, past_len=past_length)
+        q = self.apply_rope(q, cos, sin) #B, num_key_value_heads, T, head_size
+        k = self.apply_rope(k, cos, sin) #B, num_key_value_heads, T, head_size
+
+        if past_k is not None:
+            k_all = torch.cat([past_k, k], dim=2) #B, num_key_value_heads, T+past_length, head_size
+            v_all = torch.cat([past_v, v], dim=2) #B, num_key_value_heads, T+past_length, head_size
+        else:
+            k_all, v_all = k, v
 
         repeat_factor = self.config.num_attention_heads // self.config.num_key_value_heads
 
-        q = q.unsqueeze(2).reshape(B, self.config.num_key_value_heads, repeat_factor, T, self.config.head_size) #B, n_kv_heads, repeat_factor, T, head_size
-        k = k.unsqueeze(2) #B, n_kv_heads, 1, T, head_size
-        v = v.unsqueeze(2) #B, n_kv_heads, 1, T, head_size
-        
-        cos, sin = self.get_rope_params(self.config.rope_theta, self.config.head_size, T, device=x.device) #T, head_dim//2
-        q, k = self.apply_rope(q, cos, sin), self.apply_rope(k, cos, sin)
+        q = q.reshape(B, self.config.num_key_value_heads, repeat_factor, T, self.config.head_size) #B, num_key_value_heads, repeat_factor, T, head_size
+        k_all = k_all.unsqueeze(2) #B, num_key_value_heads, 1, T + past_length, head_size
+        v_all = v_all.unsqueeze(2) #B, num_key_value_heads, 1, T + past_length, head_size
 
-        scores = q @ k.transpose(3, 4) #B, n_kv_heads, repeat_factor, T, T
+        scores = q @ k_all.transpose(-1, -2) #B, num_key_value_heads, repeat_factor, T, T+past_length
+        mask = torch.tril(torch.ones(T, T+past_length, device=x.device))
+        scores = scores.masked_fill(mask==0, float("-inf"))
         scores = scores / math.sqrt(self.config.head_size)
-
-        mask = torch.tril(torch.ones((T, T), device=x.device))
-
-        scores = scores.masked_fill(mask == 0, float("-inf"))
         scores = F.softmax(scores, dim=-1)
-        scores = scores.to(dtype=self.config.torch_dtype)
-        ctx = scores @ v #B, n_kv_heads, repeat_factor, T, head_size
-        ctx = ctx.reshape(B, self.config.num_attention_heads, T, self.config.head_size)
-        ctx = ctx.transpose(1, 2) #B, T, n_heads, head_size
-        ctx = ctx.reshape(B, T, self.config.hidden_size)
+        ctx = scores @ v_all #B, num_key_value_heads, repeat_factor, T, head_size
+        ctx = ctx.reshape(B, self.config.num_attention_heads, T, self.config.head_size).transpose(1, 2) #B, T, num_attention_heads, head_size
+        ctx = ctx.reshape(B, T, C)
 
-        x = self.proj_o(ctx)
+        x = self.proj_o(ctx) #B, T, C
+
+        k_all = k_all.squeeze(2)
+        v_all = v_all.squeeze(2)
+
+        present = (k_all, v_all) if use_cache else None
+
+        return x, present
+
+
+
         
-        return x
-
-class FeedForwardNetwork(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.fc2 = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.fc3 = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
-
-    def forward(self, x):
-        x1 = self.fc1(x)
-        x2 = self.fc2(x)
-        x = x2 * F.silu(x1)
-        x = self.fc3(x)
-        return x
 
 
-class TransformerBlock(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.gqa = GroupedQueryAttention(config)
-        self.ffn = FeedForwardNetwork(config)
-        self.n1 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.n2 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, x):
-        x = x + self.gqa(self.n1(x))
-        x = x + self.ffn(self.n2(x))
-        return x
 
-class TransformerModel(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.embedder = TransformerEmbedder(config)
-        self.blocks = nn.ModuleList([TransformerBlock(config) for _ in range(config.num_hidden_layers)])
-        self.proj_o = nn.Linear(config.hidden_size, config.vocab_size)
-    def forward(self, idx, targets=None):
-        x = self.embedder(idx)
-        for block in self.blocks:
-            x = block(x)
-        logits = self.proj_o(x)
-        if targets is not None:
-            B, T, C = logits.shape
-            assert targets.shape == idx.shape
-            loss = F.cross_entropy(logits.view(B*T, C), targets.view(-1))
-        else:
-            loss = None
-        return logits, loss
-    
-
-config = LLAMA3_CONFIG()    
-m = TransformerModel(config).to(device=device, dtype=config.torch_dtype)
-
-num_params = sum([p.numel() for p in m.parameters()])
-print(num_params)
 
             
 

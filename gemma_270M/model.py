@@ -72,10 +72,9 @@ class GroupedQueryAttention(nn.Module):
     
     @staticmethod
     def get_rope_params(head_dim, theta, length, dtype=torch.float32):
-        wavelength = theta ** (torch.arange(0, head_dim, 2, dtype=dtype, device=device) / head_dim).unsqueeze(0) #1, head/dim//2
-        freq = 1 / wavelength
+        freq = theta ** (-torch.arange(0, head_dim, 2, dtype=dtype, device=device) / head_dim).unsqueeze(0) #1, head/dim//2
         positions = torch.arange(length, dtype=dtype, device=device).unsqueeze(1) #length, 1
-        angles = positions @ freq #length, head_dim//2
+        angles = positions * freq #length, head_dim//2
         cos = torch.cos(angles)
         sin = torch.sin(angles)
         return cos, sin
