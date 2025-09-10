@@ -4,7 +4,6 @@ import time
 import torch
 import torch.nn.functional as F
 
-from cutecharts.charts import Line
 from model import GEMMA3_270M_CONFIG, TransformerModel, device
 
 torch.manual_seed(1337)

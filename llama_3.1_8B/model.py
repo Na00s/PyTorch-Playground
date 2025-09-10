@@ -33,6 +33,7 @@ class LLAMA3_CONFIG:
     torch_dtype: torch.dtype = torch.bfloat16
     vocab_size: int = 128256
     head_size: int = 128
+    use_cache: bool = False
 
 class TransformerEmbedder(nn.Module):
     def __init__(self, config):
@@ -63,8 +64,8 @@ class GroupedQueryAttention(nn.Module):
         return cos, sin
     @staticmethod
     def apply_rope(x, cos, sin):
-        cos = cos.to(device=x.device)
-        sin = sin.to(device=x.device)
+        cos = cos.to(device=x.device, dtype=x.dtype)
+        sin = sin.to(device=x.device, dtype=x.dtype)
         x_even = x[..., 0::2] #..., C//2
         x_odd = x[..., 1::2] #..., C//2
         u = x_even*cos - x_odd*sin
@@ -72,7 +73,7 @@ class GroupedQueryAttention(nn.Module):
         x = torch.stack([u, v], dim=-1) #..., C//2, 2
         x = x.flatten(-2) #..., C
         return x
-    def forward(self, x, past_k, past_v, use_cache=False):
+    def forward(self, x, past_k=None, past_v=None, use_cache=False):
         B, T, C = x.shape
         q = self.proj_q(x) #B, T, num_attention_heads*head_size
         k = self.proj_k(x) #B, T, num_key_value_heads*head_size
@@ -121,9 +122,50 @@ class GroupedQueryAttention(nn.Module):
 
         return x, present
 
+class FeedForwardNetwork(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.fc2 = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.fc3 = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+    def forward(self, x):
+        return self.fc3(F.silu(self.fc2(x)) * self.fc1(x))
 
 
-        
+class TransformerBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.gqa = GroupedQueryAttention(config)  
+        self.ffn = FeedForwardNetwork(config)
+        self.n1 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.n2 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+    def forward(self, x, past=None, use_cache=False):
+        x = self.n1(x)
+        attn_out, present = self.gqa(x, past_k=None if past is None else past[0], past_v=None if past is None else past[1], use_cache=self.config.use_cache)
+        x = attn_out + x
+        x = self.n2(x)
+        x = x + self.ffn(x)
+        return x
+
+class TransformerModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        super().__init__()
+        self.config = config
+        self.embedder = TransformerEmbedder(config)
+        self.blocks = nn.ModuleList([TransformerBlock(config) for _ in range(config.num_hidden_layers)])
+        self.proj_o = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            self.proj_o.weight = self.embedder.tok_emb_table.weight
+    def forward(self, idx, targets=None, past_kv=None, use_cache=False):
+        x = self.embedder(idx)
+        presents = [] if use_cache else None
+        if past_kv is None:
+            past_kv = [None] * len(self.blocks)
+        for block, past 
+
+
 
 
 
