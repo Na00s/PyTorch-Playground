@@ -215,6 +215,6 @@ layer_types = config.layer_type
 m = TransformerModel(config, layer_types).to(device=device, dtype=config.dtype)
 
 num_parameters = sum([p.numel() for p in m.parameters()])
-print(f"total number of parameters: {num_parameters}, If we tie input and output projections: {num_parameters - m.embedder.embed_table.weight.numel()}")
+print(f"total number of parameters : {num_parameters}, If we tie input and output projections: {num_parameters - m.embedder.embed_table.weight.numel()}")
 
 
