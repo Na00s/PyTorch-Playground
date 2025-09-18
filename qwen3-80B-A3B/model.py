@@ -291,7 +291,7 @@ class Model(nn.Module):
         self.config = config
         self.embedder = TransformerEmbedder(config)
         self.GdnBlocks = nn.ModuleList([GatedDeltaNetBlock(config) for _ in range(config.num_hidden_layers//2)])
-        self.GaBlocks = nn.ModuleList([GatedDeltaNetBlock(config) for _ in range(config.num_hidden_layers//2)])
+        self.GaBlocks = nn.ModuleList([GatedAttentionBlock(config) for _ in range(config.num_hidden_layers//2)])
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size)
     def forward(self, idx, targets=None):
         x = self.embedder(idx)
@@ -309,7 +309,7 @@ class Model(nn.Module):
         return logits, loss
     def generate(self, idx, max_new_tokens=500):
         self.eval()
-        for _ in range(500):
+        for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.config.max_position_embeddings:]
             with torch.no_grad():
                 logits, _ = self(idx_cond)
