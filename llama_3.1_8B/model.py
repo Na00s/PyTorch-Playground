@@ -136,40 +136,111 @@ class FeedForwardNetwork(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
         self.gqa = GroupedQueryAttention(config)  
         self.ffn = FeedForwardNetwork(config)
         self.n1 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.n2 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
     def forward(self, x, past=None, use_cache=False):
+        residual = x
         x = self.n1(x)
-        attn_out, present = self.gqa(x, past_k=None if past is None else past[0], past_v=None if past is None else past[1], use_cache=self.config.use_cache)
-        x = attn_out + x
+        attn_out, present = self.gqa(
+            x,
+            past_k=None if past is None else past[0],
+            past_v=None if past is None else past[1],
+            use_cache=self.config.use_cache,
+        )
+        x = residual + attn_out
+
+        residual = x
         x = self.n2(x)
-        x = x + self.ffn(x)
-        return x
+        x = residual + self.ffn(x)
+
+        return x, present
+
 
 class TransformerModel(nn.Module):
     def __init__(self, config):
         super().__init__()
-        super().__init__()
         self.config = config
         self.embedder = TransformerEmbedder(config)
         self.blocks = nn.ModuleList([TransformerBlock(config) for _ in range(config.num_hidden_layers)])
+        self.ln_f = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.proj_o = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.proj_o.weight = self.embedder.tok_emb_table.weight
+
     def forward(self, idx, targets=None, past_kv=None, use_cache=False):
         x = self.embedder(idx)
         presents = [] if use_cache else None
+
         if past_kv is None:
             past_kv = [None] * len(self.blocks)
-        for block, past 
+
+        for block, past in zip(self.blocks, past_kv):
+            x, present = block(x, past=past, use_cache=use_cache)
+            if use_cache:
+                presents.append(present)
+
+        x = self.ln_f(x)
+        logits = self.proj_o(x)
+
+        loss = None
+        if targets is not None:
+            # shift logits and targets for causal LM loss
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_targets = targets[:, 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_targets.view(-1),
+                ignore_index=-100,
+            )
+
+        return (logits, loss, presents if use_cache else None)
 
 
 
 
 
 
+
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    def forward(self, x):
+        # x: [B, T, C]
+        norm = x.pow(2).mean(dim=-1, keepdim=True)
+        x_normed = x * torch.rsqrt(norm + self.eps)
+        return self.weight * x_normed
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6, elementwise_affine=True):
+        super().__init__()
+        self.eps = eps
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(hidden_size))
+            self.bias = nn.Parameter(torch.zeros(hidden_size))
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+    def forward(self, x):
+        # x: [B, T, C]
+        mean = x.mean(dim=-1, keepdim=True)
+        var = (x - mean).pow(2).mean(dim=-1, keepdim=True)
+        x_normed = (x - mean) / torch.sqrt(var + self.eps)
+
+        if self.weight is not None:
+            x_normed = self.weight * x_normed
+        if self.bias is not None:
+            x_normed = x_normed + self.bias
+
+        return x_normed
 
             
 
