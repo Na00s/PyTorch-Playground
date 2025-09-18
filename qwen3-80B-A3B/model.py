@@ -209,7 +209,7 @@ class GatedDeltaNet(nn.Module):
         v = v.reshape(B, self.config.linear_num_key_heads, repeat_factor, T, self.config.linear_value_head_dim)
 
         q = q.unsqueeze(2)
-        k = v.unsqueeze(2)
+        k = k.unsqueeze(2)
         
 
         delta = alpha * v + beta * (q-k)
