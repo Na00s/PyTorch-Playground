@@ -10,13 +10,10 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 @dataclass
 class QWEN3_80B_A3B:
-    attention_dropout: float = 0.0
-    decoder_sparse_step: int = 1
     full_attention_interval: int = 4
     head_dim: int = 256
     hidden_act: str = "silu"
     hidden_size: int = 2048
-    initializer_range: float = 0.02
     intermediate_size: int = 5120
     linear_conv_kernel_dim: int = 4
     linear_key_head_dim: int = 128
@@ -24,8 +21,6 @@ class QWEN3_80B_A3B:
     linear_num_value_heads: int = 32
     linear_value_head_dim: int = 128
     max_position_embeddings: int = 262144
-    moe_intermediate_size: int = 512
-    norm_topk_prob: bool = True
     num_attention_heads: int = 16
     num_experts: int = 512
     num_experts_per_tok: int = 10
